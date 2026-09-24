@@ -54,12 +54,7 @@ def get_market_catalysts():
         return {"bias": "NEUTRAL", "high_impact": [{"title": "News Offline.", "link": "#"}], "trade_ideas": [{"title": "News Offline.", "link": "#"}]}
 
 def evaluate_self_learning(df):
-    """
-    On-the-fly Self-Correction Engine:
-    Looks at daily closes vs next day opens over the last 15 days to train the model error rate.
-    """
     daily_data = []
-    # Group by Date (IST)
     df_dates = df.groupby(df.index.date)
     
     past_predictions = []
@@ -76,15 +71,12 @@ def evaluate_self_learning(df):
             macd = current_day['MACD_Hist'].iloc[-1]
             next_open = next_day['Open'].iloc[0]
             
-            # Simple algorithmic EOD prediction logic
             predicted_dir = "GAP UP" if macd > 0 else "GAP DOWN"
             actual_dir = "GAP UP" if next_open > close_price else "GAP DOWN"
             gap_pts = round(next_open - close_price, 2)
             
-            # Calculate Error (Absolute difference between expectation and reality)
-            # If predicted UP but gapped DOWN, error is high.
             if predicted_dir == actual_dir:
-                error = 0 # Correct prediction
+                error = 0 
             else:
                 error = abs(gap_pts)
                 error_sum += error
@@ -92,17 +84,17 @@ def evaluate_self_learning(df):
             total_gaps += 1
             
             past_predictions.append({
-                "date": dates[i].strftime("%Y-%m-%d"),
+                "date": dates[i].strftime("%b %d"),
                 "prediction": predicted_dir,
                 "actual": actual_dir,
                 "gap_pts": f"{'+' if gap_pts > 0 else ''}{gap_pts}",
-                "status": "✅ Correct" if predicted_dir == actual_dir else f"❌ Error ({error} pts)"
+                "status": "✅ Correct" if predicted_dir == actual_dir else f"❌ Miss ({error} pts)"
             })
             
     avg_error = round(error_sum / max(total_gaps, 1), 2)
-    accuracy = 100 - min((error_sum / max(total_gaps * 100, 1)) * 100, 100) # Rough heuristic
+    accuracy = 100 - min((error_sum / max(total_gaps * 100, 1)) * 100, 100) 
     
-    return past_predictions[-5:], avg_error, round(accuracy, 1)
+    return past_predictions[-4:], avg_error, round(accuracy, 1)
 
 def calculate_advanced_strategy(df):
     if len(df) < 30: raise ValueError("Insufficient historical data received from BSE.")
@@ -137,7 +129,6 @@ def calculate_advanced_strategy(df):
     df.dropna(inplace=True)
     if df.empty: raise ValueError("Data empty after cleaning indicators.")
 
-    # Run Self-Learning Module
     learning_history, avg_error, model_accuracy = evaluate_self_learning(df)
 
     last_row = df.iloc[-1]
@@ -147,11 +138,8 @@ def calculate_advanced_strategy(df):
     rsi_val = float(last_row['RSI'])
     atr_val = float(last_row['ATR'])
     
-    # Open Interest (OI) Proxy Engine
-    # Calculates institutional psychological resistance/support zones
     call_oi_resistance = int(math.ceil(spot_price / 500.0)) * 500
     put_oi_support = int(math.floor(spot_price / 500.0)) * 500
-    
     if call_oi_resistance == put_oi_support:
         call_oi_resistance += 500
         put_oi_support -= 500
@@ -161,7 +149,7 @@ def calculate_advanced_strategy(df):
     last_time = df.index[-1]
     time_val = last_time.hour * 100 + last_time.minute
     
-    # State Logic: Is market ending/closed?
+    # 15:15 IST (3:15 PM) to 09:15 IST (9:15 AM) is considered EOD for BTST predictions
     is_eod = (time_val >= 1515) or (time_val < 915)
 
     is_above_institution_trend = spot_price > last_row['EMA_Institutional']
@@ -181,20 +169,39 @@ def calculate_advanced_strategy(df):
     dynamic_sl_pts = max(50, int(atr_val * 1.0))
     
     smc_status = f"Simulated OI: Support at {put_oi_support}, Resistance at {call_oi_resistance}."
+    atm = int(round(spot_price / 100.0) * 100)
 
-    # EOD PREDICTION MODE (Tomorrow's Market)
+    # PREDICT FOR TOMORROW (EOD HOLD)
     if is_eod:
         if bullish_momentum and rsi_val < 70:
-            signal = "EOD BTST: PREDICT GAP UP"
-            recommended_strike = f"{int(round(spot_price / 100.0) * 100)} CE (Call)"
-            rationale = f"MARKET CLOSED. EOD MACD is positive. Predicting Gap Up tomorrow towards OI Resistance {call_oi_resistance}."
+            signal = "TOMORROW PREDICT: GAP UP"
+            recommended_strike = f"HOLD OVERNIGHT: {atm} CE"
+            index_target = spot_price + dynamic_target_pts
+            index_sl = spot_price - dynamic_sl_pts
+            opt_target_pts = f"Tomorrow Est: +{int(dynamic_target_pts * 0.55)} Pts"
+            opt_sl_pts = f"Tomorrow Est: -{int(dynamic_sl_pts * 0.55)} Pts"
+            rationale = f"MARKET CLOSED. Momentum is BULLISH. Predicting Gap Up tomorrow towards {call_oi_resistance} OI. Hold CE."
         elif bearish_momentum and rsi_val > 30:
-            signal = "EOD STBT: PREDICT GAP DOWN"
-            recommended_strike = f"{int(round(spot_price / 100.0) * 100)} PE (Put)"
-            rationale = f"MARKET CLOSED. EOD MACD is negative. Predicting Gap Down tomorrow towards OI Support {put_oi_support}."
+            signal = "TOMORROW PREDICT: GAP DOWN"
+            recommended_strike = f"HOLD OVERNIGHT: {atm} PE"
+            index_target = spot_price - dynamic_target_pts
+            index_sl = spot_price + dynamic_sl_pts
+            opt_target_pts = f"Tomorrow Est: +{int(dynamic_target_pts * 0.55)} Pts"
+            opt_sl_pts = f"Tomorrow Est: -{int(dynamic_sl_pts * 0.55)} Pts"
+            rationale = f"MARKET CLOSED. Momentum is BEARISH. Predicting Gap Down tomorrow towards {put_oi_support} OI. Hold PE."
         else:
-            signal = "EOD: FLAT / NEUTRAL"
-            rationale = "MARKET CLOSED. Momentum is mixed. No overnight trade recommended."
+            signal = "TOMORROW PREDICT: FLAT / NEUTRAL"
+            rationale = "MARKET CLOSED. Momentum is mixed. No overnight trade script recommended."
+
+        # Add Tomorrow's Prediction to AI Accuracy Tracker
+        pred_text = "GAP UP" if "UP" in signal else "GAP DOWN" if "DOWN" in signal else "FLAT"
+        learning_history.append({
+            "date": "Tmrw (Pending)",
+            "prediction": pred_text,
+            "actual": "---",
+            "gap_pts": "---",
+            "status": "⏳ Waiting Open"
+        })
     
     # INTRADAY MODE
     else:
@@ -205,8 +212,7 @@ def calculate_advanced_strategy(df):
             rationale = "Market footprint is dead. Waiting for volume expansion."
         elif bullish_condition:
             signal = "BUY SIGNAL (15m CONFLUENCE)"
-            atm = int(round(spot_price / 100.0) * 100)
-            recommended_strike = f"{atm} CE (Targeting {call_oi_resistance} OI)"
+            recommended_strike = f"BUY INTRADAY: {atm} CE"
             index_target = spot_price + dynamic_target_pts
             index_sl = spot_price - dynamic_sl_pts
             opt_target_pts = f"+{int(dynamic_target_pts * 0.55)} Premium Pts" 
@@ -214,8 +220,7 @@ def calculate_advanced_strategy(df):
             rationale = f"BULLISH CONFIRMED: Breaking towards Call OI resistance at {call_oi_resistance}."
         elif bearish_condition:
             signal = "SELL SIGNAL (15m CONFLUENCE)"
-            atm = int(round(spot_price / 100.0) * 100)
-            recommended_strike = f"{atm} PE (Targeting {put_oi_support} OI)"
+            recommended_strike = f"BUY INTRADAY: {atm} PE"
             index_target = spot_price - dynamic_target_pts
             index_sl = spot_price + dynamic_sl_pts
             opt_target_pts = f"+{int(dynamic_target_pts * 0.55)} Premium Pts"
@@ -234,8 +239,7 @@ def calculate_advanced_strategy(df):
         "reversal_warning": reversal, "reversal_color": reversal_color,
         "rsi": round(rsi_val, 2), "atr": round(atr_val, 2), 
         "rationale": rationale, "smc_status": smc_status,
-        "learning_history": learning_history, "model_accuracy": model_accuracy, "avg_error": avg_error,
-        "put_oi_support": put_oi_support, "call_oi_res": call_oi_resistance
+        "learning_history": learning_history, "model_accuracy": model_accuracy, "avg_error": avg_error
     }
 
 @app.get("/api/market_data")
@@ -243,7 +247,8 @@ def get_market_data():
     global last_recorded_signal, trade_history_log
     try:
         ticker = yf.Ticker("^BSESN")
-        df = ticker.history(period="15d", interval="15m")
+        # EXPLICITLY SET TO 7 DAYS TO SHOW EXACTLY A 1-WEEK TREND ON THE CHART
+        df = ticker.history(period="7d", interval="15m")
         if df.empty: return {"error": "Market data empty. Ensure internet connection and market hours."}
         if df.index.tz is None: df.index = df.index.tz_localize('Asia/Kolkata')
         else: df.index = df.index.tz_convert('Asia/Kolkata')
@@ -252,11 +257,11 @@ def get_market_data():
         strategy = calculate_advanced_strategy(df)
         
         current_signal = strategy["signal"]
-        if ("CONFLUENCE" in current_signal or "BTST" in current_signal) and current_signal != last_recorded_signal:
+        if ("CONFLUENCE" in current_signal or "PREDICT" in current_signal) and current_signal != last_recorded_signal:
             ist_time = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d %H:%M:%S")
             trade_history_log.insert(0, {
                 "time": ist_time,
-                "type": current_signal.replace(" (15m CONFLUENCE)", ""),
+                "type": current_signal.split(" ")[0], 
                 "strike": strategy["recommended_strike"],
                 "entry": strategy["entry_spot"],
                 "target": strategy["index_target"],
@@ -310,7 +315,7 @@ HTML_INTERFACE = """
         <!-- Header -->
         <div class="flex flex-col md:flex-row justify-between items-center bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700 gap-4">
             <div class="flex items-center space-x-4">
-                <h1 class="text-2xl font-bold text-emerald-400">SENSEX AlphaDesk <span class="text-xs text-purple-400 border border-purple-500 px-1 rounded">AI ENGINE</span></h1>
+                <h1 class="text-2xl font-bold text-emerald-400">SENSEX AlphaDesk <span class="text-xs text-purple-400 border border-purple-500 px-1 rounded">AI PREDICTOR</span></h1>
                 <span id="market-timer" class="text-xs px-2 py-1 rounded font-bold bg-gray-700 text-gray-300">CALCULATING...</span>
             </div>
             
@@ -339,7 +344,7 @@ HTML_INTERFACE = """
                 <div class="bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700 overflow-hidden">
                     <div class="flex justify-between items-center mb-4">
                         <div class="flex items-center space-x-3">
-                            <h2 class="text-lg font-bold text-gray-200">SENSEX Spot</h2>
+                            <h2 class="text-lg font-bold text-gray-200">1-Week SENSEX Trend</h2>
                             <div class="text-[10px] flex space-x-2 font-mono">
                                 <span class="text-green-400">● EMA9</span>
                                 <span class="text-red-400">● EMA21</span>
@@ -367,12 +372,11 @@ HTML_INTERFACE = """
 
             <div class="space-y-4">
                 <div class="bg-blue-950/40 p-5 rounded-xl border border-blue-700/50 shadow-lg relative overflow-hidden">
-                    <div class="absolute top-0 right-0 bg-blue-700 text-white text-[10px] px-2 py-1 rounded-bl-lg font-bold">DYNAMIC STRIKE SELECTOR</div>
+                    <div class="absolute top-0 right-0 bg-blue-700 text-white text-[10px] px-2 py-1 rounded-bl-lg font-bold">DYNAMIC SCRIPT SELECTOR</div>
                     <h2 class="text-sm text-blue-300 font-bold uppercase tracking-wider mb-2">Option Contract</h2>
                     <div id="strike-text" class="text-[1.1rem] md:text-xl font-mono font-bold mb-1 text-white">AWAITING...</div>
-                    <p class="text-[10px] text-gray-400 mb-4">Calculates exact ATM based on Spot & OI.</p>
                     
-                    <div class="grid grid-cols-2 gap-3 text-sm font-mono">
+                    <div class="grid grid-cols-2 gap-3 text-sm font-mono mt-4">
                         <div class="bg-gray-900/60 p-2 rounded border border-gray-700">
                             <span class="text-gray-500 block text-[10px] uppercase">Option Target</span>
                             <span id="opt-target" class="text-emerald-400 font-bold">---</span>
@@ -386,7 +390,7 @@ HTML_INTERFACE = """
 
                 <div class="bg-gray-800 p-5 rounded-xl border border-gray-700 shadow-lg">
                     <h2 class="text-sm text-gray-400 font-bold uppercase tracking-wider mb-2">Underlying Spot Triggers</h2>
-                    <div id="signal-text" class="text-[1.1rem] font-bold mb-4">WAITING FOR CONFLUENCE...</div>
+                    <div id="signal-text" class="text-xl font-bold mb-4">WAITING FOR CONFLUENCE...</div>
                     <div class="grid grid-cols-2 gap-4 text-sm font-mono">
                         <div class="bg-gray-900 p-3 rounded border border-gray-700">
                             <span class="text-gray-500 block text-[10px] uppercase">Spot Target</span>
@@ -405,13 +409,11 @@ HTML_INTERFACE = """
             </div>
         </div>
 
-        <!-- NEW DIVISION: AI Learning & History -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
-            <!-- Automated Call Log -->
             <div class="bg-gray-800 rounded-xl shadow-lg border border-gray-700 overflow-hidden">
                 <div class="bg-gray-900 p-3 border-b border-gray-700 flex justify-between items-center">
                     <h2 class="text-sm font-bold text-gray-200 uppercase tracking-wider flex items-center">
-                        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse mr-2"></span> Automated Call Log
+                        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse mr-2"></span> Automated Call Log (Session)
                     </h2>
                 </div>
                 <div class="overflow-x-auto h-64">
@@ -425,17 +427,16 @@ HTML_INTERFACE = """
                             </tr>
                         </thead>
                         <tbody id="trade-history-table">
-                            <tr class="bg-gray-800"><td colspan="4" class="px-4 py-4 text-center">Awaiting first algorithmic trigger...</td></tr>
+                            <tr class="bg-gray-800"><td colspan="4" class="px-4 py-4 text-center">Awaiting algorithmic trigger...</td></tr>
                         </tbody>
                     </table>
                 </div>
             </div>
             
-            <!-- Self-Learning Accuracy Matrix -->
             <div class="bg-gray-800 rounded-xl shadow-lg border border-gray-700 overflow-hidden">
                 <div class="bg-gray-900 p-3 border-b border-gray-700 flex justify-between items-center">
                     <h2 class="text-sm font-bold text-gray-200 uppercase tracking-wider flex items-center">
-                        <span class="w-2 h-2 rounded-full bg-purple-500 animate-pulse mr-2"></span> AI Self-Learning & EOD Accuracy
+                        <span class="w-2 h-2 rounded-full bg-purple-500 animate-pulse mr-2"></span> AI Tomorrow Predictor & Accuracy
                     </h2>
                     <span id="accuracy-badge" class="px-2 py-1 bg-purple-900 text-purple-300 rounded text-xs font-bold font-mono">Acc: --%</span>
                 </div>
@@ -599,14 +600,14 @@ HTML_INTERFACE = """
                     updateHTML('trade-history-table', tableHTML);
                 }
 
-                // Update AI Learning Table
+                // Update AI Learning Table (Includes Tomorrow's Pending Prediction)
                 if (strat.learning_history && strat.learning_history.length > 0) {
                     updateText('accuracy-badge', `Acc: ${strat.model_accuracy}% (Err: ${strat.avg_error})`);
                     const learnHTML = strat.learning_history.reverse().map(l => `
                         <tr class="bg-gray-800 border-b border-gray-700 hover:bg-gray-700">
                             <td class="px-4 py-2">${l.date}</td>
                             <td class="px-4 py-2 font-bold ${l.prediction.includes('UP') ? 'text-emerald-400' : 'text-red-400'}">${l.prediction}</td>
-                            <td class="px-4 py-2 font-mono">${l.actual} (${l.gap_pts})</td>
+                            <td class="px-4 py-2 font-mono">${l.actual} ${l.gap_pts !== '---' ? '('+l.gap_pts+')' : ''}</td>
                             <td class="px-4 py-2">${l.status}</td>
                         </tr>
                     `).join('');
@@ -623,7 +624,6 @@ HTML_INTERFACE = """
             }
         }
         
-        if (Notification.permission !== "granted") { Notification.requestPermission(); }
         fetchMarketData(); setInterval(fetchMarketData, 5000); 
     </script>
 </body>
