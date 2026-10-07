@@ -149,8 +149,9 @@ def calculate_advanced_strategy(df):
     last_time = df.index[-1]
     time_val = last_time.hour * 100 + last_time.minute
     
-    # 15:15 IST (3:15 PM) to 09:15 IST (9:15 AM) is considered EOD for BTST predictions
-    is_eod = (time_val >= 1515) or (time_val < 915)
+    # UPGRADE: 15:00 IST (3:00 PM) to 09:15 IST (9:15 AM) is considered EOD for BTST predictions
+    # This allows you 30 minutes to enter the script before the market actually closes.
+    is_eod = (time_val >= 1500) or (time_val < 915)
 
     is_above_institution_trend = spot_price > last_row['EMA_Institutional']
     is_below_institution_trend = spot_price < last_row['EMA_Institutional']
@@ -171,27 +172,27 @@ def calculate_advanced_strategy(df):
     smc_status = f"Simulated OI: Support at {put_oi_support}, Resistance at {call_oi_resistance}."
     atm = int(round(spot_price / 100.0) * 100)
 
-    # PREDICT FOR TOMORROW (EOD HOLD)
+    # PREDICT FOR TOMORROW (BTST / EOD HOLD)
     if is_eod:
         if bullish_momentum and rsi_val < 70:
             signal = "TOMORROW PREDICT: GAP UP"
-            recommended_strike = f"HOLD OVERNIGHT: {atm} CE"
+            recommended_strike = f"BTST EXECUTE: {atm} CE"
             index_target = spot_price + dynamic_target_pts
             index_sl = spot_price - dynamic_sl_pts
             opt_target_pts = f"Tomorrow Est: +{int(dynamic_target_pts * 0.55)} Pts"
             opt_sl_pts = f"Tomorrow Est: -{int(dynamic_sl_pts * 0.55)} Pts"
-            rationale = f"MARKET CLOSED. Momentum is BULLISH. Predicting Gap Up tomorrow towards {call_oi_resistance} OI. Hold CE."
+            rationale = f"BTST WINDOW OPEN. Momentum is BULLISH. Predicting Gap Up tomorrow towards {call_oi_resistance} OI. Execute CE."
         elif bearish_momentum and rsi_val > 30:
             signal = "TOMORROW PREDICT: GAP DOWN"
-            recommended_strike = f"HOLD OVERNIGHT: {atm} PE"
+            recommended_strike = f"STBT EXECUTE: {atm} PE"
             index_target = spot_price - dynamic_target_pts
             index_sl = spot_price + dynamic_sl_pts
             opt_target_pts = f"Tomorrow Est: +{int(dynamic_target_pts * 0.55)} Pts"
             opt_sl_pts = f"Tomorrow Est: -{int(dynamic_sl_pts * 0.55)} Pts"
-            rationale = f"MARKET CLOSED. Momentum is BEARISH. Predicting Gap Down tomorrow towards {put_oi_support} OI. Hold PE."
+            rationale = f"STBT WINDOW OPEN. Momentum is BEARISH. Predicting Gap Down tomorrow towards {put_oi_support} OI. Execute PE."
         else:
             signal = "TOMORROW PREDICT: FLAT / NEUTRAL"
-            rationale = "MARKET CLOSED. Momentum is mixed. No overnight trade script recommended."
+            rationale = "BTST WINDOW OPEN. Momentum is mixed. No overnight trade script recommended. Stay Cash."
 
         # Add Tomorrow's Prediction to AI Accuracy Tracker
         pred_text = "GAP UP" if "UP" in signal else "GAP DOWN" if "DOWN" in signal else "FLAT"
@@ -247,7 +248,6 @@ def get_market_data():
     global last_recorded_signal, trade_history_log
     try:
         ticker = yf.Ticker("^BSESN")
-        # EXPLICITLY SET TO 7 DAYS TO SHOW EXACTLY A 1-WEEK TREND ON THE CHART
         df = ticker.history(period="7d", interval="15m")
         if df.empty: return {"error": "Market data empty. Ensure internet connection and market hours."}
         if df.index.tz is None: df.index = df.index.tz_localize('Asia/Kolkata')
@@ -587,7 +587,6 @@ HTML_INTERFACE = """
                 updateText('reversal-status', strat.reversal_warning);
                 updateClass('reversal-status', `${strat.reversal_color} font-bold text-xs`);
 
-                // Update Trade History Table
                 if (data.trade_history && data.trade_history.length > 0) {
                     const tableHTML = data.trade_history.map(trade => `
                         <tr class="bg-gray-800 border-b border-gray-700 hover:bg-gray-700">
@@ -600,7 +599,6 @@ HTML_INTERFACE = """
                     updateHTML('trade-history-table', tableHTML);
                 }
 
-                // Update AI Learning Table (Includes Tomorrow's Pending Prediction)
                 if (strat.learning_history && strat.learning_history.length > 0) {
                     updateText('accuracy-badge', `Acc: ${strat.model_accuracy}% (Err: ${strat.avg_error})`);
                     const learnHTML = strat.learning_history.reverse().map(l => `
@@ -624,6 +622,7 @@ HTML_INTERFACE = """
             }
         }
         
+        if (Notification.permission !== "granted") { Notification.requestPermission(); }
         fetchMarketData(); setInterval(fetchMarketData, 5000); 
     </script>
 </body>
