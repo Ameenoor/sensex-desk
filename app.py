@@ -20,7 +20,8 @@ app.add_middleware(
 )
 
 trade_history_log = []
-last_recorded_signal = None
+last_recorded_signal = "NEUTRAL"
+history_initialized = False
 
 def get_market_catalysts():
     try:
@@ -54,9 +55,7 @@ def get_market_catalysts():
         return {"bias": "NEUTRAL", "high_impact": [{"title": "News Offline.", "link": "#"}], "trade_ideas": [{"title": "News Offline.", "link": "#"}]}
 
 def evaluate_self_learning(df):
-    daily_data = []
     df_dates = df.groupby(df.index.date)
-    
     past_predictions = []
     error_sum = 0
     total_gaps = 0
@@ -75,14 +74,12 @@ def evaluate_self_learning(df):
             actual_dir = "GAP UP" if next_open > close_price else "GAP DOWN"
             gap_pts = round(next_open - close_price, 2)
             
-            if predicted_dir == actual_dir:
-                error = 0 
+            if predicted_dir == actual_dir: error = 0 
             else:
                 error = abs(gap_pts)
                 error_sum += error
                 
             total_gaps += 1
-            
             past_predictions.append({
                 "date": dates[i].strftime("%b %d"),
                 "prediction": predicted_dir,
@@ -95,6 +92,63 @@ def evaluate_self_learning(df):
     accuracy = 100 - min((error_sum / max(total_gaps * 100, 1)) * 100, 100) 
     
     return past_predictions[-4:], avg_error, round(accuracy, 1)
+
+def generate_historical_log(df):
+    """Backfills the trade log with historical signals so it is never empty."""
+    hist = []
+    last_sig = "NEUTRAL"
+    start_idx = max(30, len(df) - 100) # Scan up to last 100 candles
+    
+    for i in range(start_idx, len(df)):
+        row = df.iloc[i]
+        prev_row = df.iloc[i-1]
+        
+        spot = row['Close']
+        macd = row['MACD_Hist']
+        prev_macd = prev_row['MACD_Hist']
+        ema9 = row['EMA9']
+        ema21 = row['EMA21']
+        rsi = row['RSI']
+        inst = row['EMA_Institutional']
+        atr = row['ATR']
+        
+        bull_mom = macd > prev_macd and macd > 0
+        bear_mom = macd < prev_macd and macd < 0
+        fp_active = row['TR'] >= (row['Avg_TR_5'] * 0.75)
+        
+        t = df.index[i]
+        time_val = t.hour * 100 + t.minute
+        in_dead = (time_val >= 1200 and time_val < 1330)
+        
+        bull_cond = (ema9 > ema21) and bull_mom and (rsi < 65) and (spot > inst) and fp_active and not in_dead
+        bear_cond = (ema9 < ema21) and bear_mom and (rsi > 35) and (spot < inst) and fp_active and not in_dead
+        
+        sig = "NEUTRAL"
+        if bull_cond: sig = "BUY"
+        elif bear_cond: sig = "SELL"
+        
+        if sig != "NEUTRAL" and sig != last_sig:
+            atm = int(round(spot / 100.0) * 100)
+            strike = f"{atm} CE" if sig == "BUY" else f"{atm} PE"
+            target = round(spot + max(100, atr*2.0), 2) if sig == "BUY" else round(spot - max(100, atr*2.0), 2)
+            sl = round(spot - max(50, atr*1.0), 2) if sig == "BUY" else round(spot + max(50, atr*1.0), 2)
+            
+            ist_time = t.strftime("%m-%d %H:%M")
+            hist.insert(0, {
+                "time": ist_time,
+                "type": sig,
+                "strike": strike,
+                "entry": round(spot, 2),
+                "target": target,
+                "sl": sl
+            })
+            last_sig = sig
+        elif sig == "NEUTRAL":
+            # Reset logic on crossover to allow new signals
+            if (ema9 < ema21 and last_sig == "BUY") or (ema9 > ema21 and last_sig == "SELL"):
+                last_sig = "NEUTRAL"
+                
+    return hist[:50], last_sig
 
 def calculate_advanced_strategy(df):
     if len(df) < 30: raise ValueError("Insufficient historical data received from BSE.")
@@ -149,120 +203,110 @@ def calculate_advanced_strategy(df):
     last_time = df.index[-1]
     time_val = last_time.hour * 100 + last_time.minute
     
-    # UPGRADE: 15:00 IST (3:00 PM) to 09:15 IST (9:15 AM) is considered EOD for BTST predictions
-    # This allows you 30 minutes to enter the script before the market actually closes.
-    is_eod = (time_val >= 1500) or (time_val < 915)
-
     is_above_institution_trend = spot_price > last_row['EMA_Institutional']
     is_below_institution_trend = spot_price < last_row['EMA_Institutional']
     bullish_momentum = last_row['MACD_Hist'] > 0
     bearish_momentum = last_row['MACD_Hist'] < 0
 
-    signal = "NEUTRAL"
-    recommended_strike = "---"
-    index_target = 0
-    index_sl = 0
-    opt_target_pts = "---"
-    opt_sl_pts = "---"
-    rationale = "Monitoring Price Action. Confluence not yet established."
-    
     dynamic_target_pts = max(100, int(atr_val * 2.0)) 
     dynamic_sl_pts = max(50, int(atr_val * 1.0))
-    
-    smc_status = f"Simulated OI: Support at {put_oi_support}, Resistance at {call_oi_resistance}."
     atm = int(round(spot_price / 100.0) * 100)
-
-    # PREDICT FOR TOMORROW (BTST / EOD HOLD)
-    if is_eod:
-        if bullish_momentum and rsi_val < 70:
-            signal = "TOMORROW PREDICT: GAP UP"
-            recommended_strike = f"BTST EXECUTE: {atm} CE"
-            index_target = spot_price + dynamic_target_pts
-            index_sl = spot_price - dynamic_sl_pts
-            opt_target_pts = f"Tomorrow Est: +{int(dynamic_target_pts * 0.55)} Pts"
-            opt_sl_pts = f"Tomorrow Est: -{int(dynamic_sl_pts * 0.55)} Pts"
-            rationale = f"BTST WINDOW OPEN. Momentum is BULLISH. Predicting Gap Up tomorrow towards {call_oi_resistance} OI. Execute CE."
-        elif bearish_momentum and rsi_val > 30:
-            signal = "TOMORROW PREDICT: GAP DOWN"
-            recommended_strike = f"STBT EXECUTE: {atm} PE"
-            index_target = spot_price - dynamic_target_pts
-            index_sl = spot_price + dynamic_sl_pts
-            opt_target_pts = f"Tomorrow Est: +{int(dynamic_target_pts * 0.55)} Pts"
-            opt_sl_pts = f"Tomorrow Est: -{int(dynamic_sl_pts * 0.55)} Pts"
-            rationale = f"STBT WINDOW OPEN. Momentum is BEARISH. Predicting Gap Down tomorrow towards {put_oi_support} OI. Execute PE."
-        else:
-            signal = "TOMORROW PREDICT: FLAT / NEUTRAL"
-            rationale = "BTST WINDOW OPEN. Momentum is mixed. No overnight trade script recommended. Stay Cash."
-
-        # Add Tomorrow's Prediction to AI Accuracy Tracker
-        pred_text = "GAP UP" if "UP" in signal else "GAP DOWN" if "DOWN" in signal else "FLAT"
-        learning_history.append({
-            "date": "Tmrw (Pending)",
-            "prediction": pred_text,
-            "actual": "---",
-            "gap_pts": "---",
-            "status": "⏳ Waiting Open"
-        })
     
-    # INTRADAY MODE
-    else:
-        bullish_condition = ((last_row['EMA9'] > last_row['EMA21']) and bullish_momentum and (rsi_val < 65) and is_above_institution_trend and footprint_active)
-        bearish_condition = ((last_row['EMA9'] < last_row['EMA21']) and bearish_momentum and (rsi_val > 35) and is_below_institution_trend and footprint_active)
+    # Continuous EOD Predictor (Always Calculates)
+    eod_pred = "FLAT / NEUTRAL"
+    eod_script = "CASH (No Trade)"
+    if bullish_momentum and rsi_val < 70:
+        eod_pred = "GAP UP"
+        eod_script = f"HOLD {atm} CE"
+    elif bearish_momentum and rsi_val > 30:
+        eod_pred = "GAP DOWN"
+        eod_script = f"HOLD {atm} PE"
 
-        if not footprint_active:
-            rationale = "Market footprint is dead. Waiting for volume expansion."
-        elif bullish_condition:
-            signal = "BUY SIGNAL (15m CONFLUENCE)"
-            recommended_strike = f"BUY INTRADAY: {atm} CE"
-            index_target = spot_price + dynamic_target_pts
-            index_sl = spot_price - dynamic_sl_pts
-            opt_target_pts = f"+{int(dynamic_target_pts * 0.55)} Premium Pts" 
-            opt_sl_pts = f"-{int(dynamic_sl_pts * 0.55)} Premium Pts"
-            rationale = f"BULLISH CONFIRMED: Breaking towards Call OI resistance at {call_oi_resistance}."
-        elif bearish_condition:
-            signal = "SELL SIGNAL (15m CONFLUENCE)"
-            recommended_strike = f"BUY INTRADAY: {atm} PE"
-            index_target = spot_price - dynamic_target_pts
-            index_sl = spot_price + dynamic_sl_pts
-            opt_target_pts = f"+{int(dynamic_target_pts * 0.55)} Premium Pts"
-            opt_sl_pts = f"-{int(dynamic_sl_pts * 0.55)} Premium Pts"
-            rationale = f"BEARISH CONFIRMED: Breaking towards Put OI support at {put_oi_support}."
+    # Insert Live Prediction into History Table
+    learning_history.append({
+        "date": "Tmrw (Pending)",
+        "prediction": eod_pred,
+        "actual": "---",
+        "gap_pts": "---",
+        "status": "⏳ Waiting Open"
+    })
+
+    # Intraday Execution Logic
+    signal = "NEUTRAL"
+    # Fix for Image 1: Always suggest monitoring scripts even if Neutral
+    trend_bias = "CE" if last_row['EMA9'] > last_row['EMA21'] else "PE"
+    recommended_strike = f"Tracking Base: {atm} {trend_bias}"
+    
+    index_target = spot_price + dynamic_target_pts if trend_bias == "CE" else spot_price - dynamic_target_pts
+    index_sl = spot_price - dynamic_sl_pts if trend_bias == "CE" else spot_price + dynamic_sl_pts
+    opt_target_pts = f"Proj Target: +{int(dynamic_target_pts * 0.55)} Pts"
+    opt_sl_pts = f"Proj SL: -{int(dynamic_sl_pts * 0.55)} Pts"
+    
+    rationale = "Monitoring Price Action. Confluence not yet established."
+    smc_status = f"Simulated OI: Support at {put_oi_support}, Resistance at {call_oi_resistance}."
+
+    bullish_condition = ((last_row['EMA9'] > last_row['EMA21']) and (last_row['MACD_Hist'] > prev_row['MACD_Hist']) and bullish_momentum and (rsi_val < 65) and is_above_institution_trend and footprint_active)
+    bearish_condition = ((last_row['EMA9'] < last_row['EMA21']) and (last_row['MACD_Hist'] < prev_row['MACD_Hist']) and bearish_momentum and (rsi_val > 35) and is_below_institution_trend and footprint_active)
+
+    if not footprint_active:
+        rationale = "Market footprint is flat. Waiting for volume expansion."
+    elif bullish_condition:
+        signal = "BUY SIGNAL (15m CONFLUENCE)"
+        recommended_strike = f"EXECUTE: {atm} CE"
+        opt_target_pts = f"+{int(dynamic_target_pts * 0.55)} Premium Pts" 
+        opt_sl_pts = f"-{int(dynamic_sl_pts * 0.55)} Premium Pts"
+        rationale = f"BULLISH CONFIRMED: Breaking towards Call OI resistance at {call_oi_resistance}."
+    elif bearish_condition:
+        signal = "SELL SIGNAL (15m CONFLUENCE)"
+        recommended_strike = f"EXECUTE: {atm} PE"
+        opt_target_pts = f"+{int(dynamic_target_pts * 0.55)} Premium Pts"
+        opt_sl_pts = f"-{int(dynamic_sl_pts * 0.55)} Premium Pts"
+        rationale = f"BEARISH CONFIRMED: Breaking towards Put OI support at {put_oi_support}."
 
     reversal = "SAFE (No Exhaustion)"
     reversal_color = "text-emerald-400"
     if rsi_val >= 75: reversal = f"⚠ EXTREME OVERBOUGHT - OI CALL SELLERS TRAPPED"; reversal_color = "text-red-500 animate-pulse"
     elif rsi_val <= 25: reversal = f"⚠ EXTREME OVERSOLD - OI PUT SELLERS TRAPPED"; reversal_color = "text-red-500 animate-pulse"
 
+    current_timestamp = last_time.strftime("%H:%M:%S IST")
+
     return {
         "signal": signal, "entry_spot": spot_price, "recommended_strike": recommended_strike,
         "index_target": round(index_target, 2), "index_sl": round(index_sl, 2),
-        "option_target_pts": opt_target_pts, "option_sl_pts": opt_sl_pts,
+        "opt_target_pts": opt_target_pts, "opt_sl_pts": opt_sl_pts,
         "reversal_warning": reversal, "reversal_color": reversal_color,
         "rsi": round(rsi_val, 2), "atr": round(atr_val, 2), 
         "rationale": rationale, "smc_status": smc_status,
-        "learning_history": learning_history, "model_accuracy": model_accuracy, "avg_error": avg_error
+        "learning_history": learning_history, "model_accuracy": model_accuracy, "avg_error": avg_error,
+        "eod_pred": eod_pred, "eod_script": eod_script, "timestamp": current_timestamp
     }
 
 @app.get("/api/market_data")
 def get_market_data():
-    global last_recorded_signal, trade_history_log
+    global last_recorded_signal, trade_history_log, history_initialized
     try:
         ticker = yf.Ticker("^BSESN")
         df = ticker.history(period="7d", interval="15m")
         if df.empty: return {"error": "Market data empty. Ensure internet connection and market hours."}
         if df.index.tz is None: df.index = df.index.tz_localize('Asia/Kolkata')
         else: df.index = df.index.tz_convert('Asia/Kolkata')
-
         df = df[~df.index.duplicated(keep='first')].sort_index()
+
+        # Fix Image 2: Seed the trade history table on first run
+        if not history_initialized:
+            trade_history_log, last_recorded_signal = generate_historical_log(df)
+            history_initialized = True
+
         strategy = calculate_advanced_strategy(df)
         
+        # Live Append to Logger
         current_signal = strategy["signal"]
-        if ("CONFLUENCE" in current_signal or "PREDICT" in current_signal) and current_signal != last_recorded_signal:
-            ist_time = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d %H:%M:%S")
+        if "CONFLUENCE" in current_signal and current_signal != last_recorded_signal:
+            ist_time = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%m-%d %H:%M")
             trade_history_log.insert(0, {
                 "time": ist_time,
                 "type": current_signal.split(" ")[0], 
-                "strike": strategy["recommended_strike"],
+                "strike": strategy["recommended_strike"].replace("EXECUTE: ", ""),
                 "entry": strategy["entry_spot"],
                 "target": strategy["index_target"],
                 "sl": strategy["index_sl"]
@@ -312,10 +356,9 @@ HTML_INTERFACE = """
     <div class="max-w-7xl mx-auto space-y-6">
         <div id="error-banner" class="hidden bg-red-900 border-2 border-red-500 text-white p-4 rounded-xl text-sm font-mono break-words shadow-lg"></div>
 
-        <!-- Header -->
         <div class="flex flex-col md:flex-row justify-between items-center bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700 gap-4">
             <div class="flex items-center space-x-4">
-                <h1 class="text-2xl font-bold text-emerald-400">SENSEX AlphaDesk <span class="text-xs text-purple-400 border border-purple-500 px-1 rounded">AI PREDICTOR</span></h1>
+                <h1 class="text-2xl font-bold text-emerald-400">SENSEX AlphaDesk <span class="text-xs text-purple-400 border border-purple-500 px-1 rounded">AI ENGINE</span></h1>
                 <span id="market-timer" class="text-xs px-2 py-1 rounded font-bold bg-gray-700 text-gray-300">CALCULATING...</span>
             </div>
             
@@ -363,7 +406,7 @@ HTML_INTERFACE = """
                             <p id="smc-text" class="text-sm text-gray-300 font-medium">Analyzing Liquidity Zones...</p>
                         </div>
                         <div class="flex-1 border-t md:border-t-0 md:border-l border-gray-700 pt-3 md:pt-0 md:pl-4">
-                            <h3 class="text-[10px] text-emerald-400 uppercase tracking-widest mb-1 font-bold">AI Rationale</h3>
+                            <h3 class="text-[10px] text-emerald-400 uppercase tracking-widest mb-1 font-bold">Execution Rationale</h3>
                             <p id="rationale-text" class="text-sm text-gray-300 font-medium leading-relaxed">Processing live data...</p>
                         </div>
                     </div>
@@ -374,9 +417,13 @@ HTML_INTERFACE = """
                 <div class="bg-blue-950/40 p-5 rounded-xl border border-blue-700/50 shadow-lg relative overflow-hidden">
                     <div class="absolute top-0 right-0 bg-blue-700 text-white text-[10px] px-2 py-1 rounded-bl-lg font-bold">DYNAMIC SCRIPT SELECTOR</div>
                     <h2 class="text-sm text-blue-300 font-bold uppercase tracking-wider mb-2">Option Contract</h2>
-                    <div id="strike-text" class="text-[1.1rem] md:text-xl font-mono font-bold mb-1 text-white">AWAITING...</div>
+                    <div class="flex justify-between items-end mb-1">
+                        <div id="strike-text" class="text-[1.1rem] md:text-xl font-mono font-bold text-white">AWAITING...</div>
+                        <div id="strike-time" class="text-[10px] text-gray-400 font-mono">--:--:--</div>
+                    </div>
+                    <p class="text-[10px] text-gray-400 mb-4">Calculates tracking ATM based on real-time Spot.</p>
                     
-                    <div class="grid grid-cols-2 gap-3 text-sm font-mono mt-4">
+                    <div class="grid grid-cols-2 gap-3 text-sm font-mono">
                         <div class="bg-gray-900/60 p-2 rounded border border-gray-700">
                             <span class="text-gray-500 block text-[10px] uppercase">Option Target</span>
                             <span id="opt-target" class="text-emerald-400 font-bold">---</span>
@@ -413,21 +460,23 @@ HTML_INTERFACE = """
             <div class="bg-gray-800 rounded-xl shadow-lg border border-gray-700 overflow-hidden">
                 <div class="bg-gray-900 p-3 border-b border-gray-700 flex justify-between items-center">
                     <h2 class="text-sm font-bold text-gray-200 uppercase tracking-wider flex items-center">
-                        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse mr-2"></span> Automated Call Log (Session)
+                        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse mr-2"></span> Algorithmic Call Log (History)
                     </h2>
                 </div>
-                <div class="overflow-x-auto h-64">
+                <div class="overflow-x-auto h-[320px]">
                     <table class="w-full text-sm text-left text-gray-400">
-                        <thead class="text-xs text-gray-500 uppercase bg-gray-900/50 border-b border-gray-700">
+                        <thead class="text-xs text-gray-500 uppercase bg-gray-900/50 border-b border-gray-700 sticky top-0">
                             <tr>
                                 <th class="px-4 py-2">Time (IST)</th>
                                 <th class="px-4 py-2">Type</th>
                                 <th class="px-4 py-2">Script</th>
                                 <th class="px-4 py-2">Entry</th>
+                                <th class="px-4 py-2">Target</th>
+                                <th class="px-4 py-2">SL</th>
                             </tr>
                         </thead>
                         <tbody id="trade-history-table">
-                            <tr class="bg-gray-800"><td colspan="4" class="px-4 py-4 text-center">Awaiting algorithmic trigger...</td></tr>
+                            <tr class="bg-gray-800"><td colspan="6" class="px-4 py-4 text-center">Loading Historical Data...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -436,13 +485,28 @@ HTML_INTERFACE = """
             <div class="bg-gray-800 rounded-xl shadow-lg border border-gray-700 overflow-hidden">
                 <div class="bg-gray-900 p-3 border-b border-gray-700 flex justify-between items-center">
                     <h2 class="text-sm font-bold text-gray-200 uppercase tracking-wider flex items-center">
-                        <span class="w-2 h-2 rounded-full bg-purple-500 animate-pulse mr-2"></span> AI Tomorrow Predictor & Accuracy
+                        <span class="w-2 h-2 rounded-full bg-purple-500 animate-pulse mr-2"></span> AI Tomorrow Predictor
                     </h2>
                     <span id="accuracy-badge" class="px-2 py-1 bg-purple-900 text-purple-300 rounded text-xs font-bold font-mono">Acc: --%</span>
                 </div>
-                <div class="overflow-x-auto h-64">
+                
+                <!-- NEW FEATURE: Live Pre-Close Predictor Banner -->
+                <div class="p-4 bg-gray-800">
+                    <div class="bg-purple-900/40 border border-purple-500/50 p-4 rounded-lg flex justify-between items-center shadow-inner">
+                        <div>
+                            <h3 class="text-[10px] text-purple-300 font-bold tracking-widest uppercase">Live EOD Projection</h3>
+                            <p class="text-xl font-bold text-white mt-1" id="eod-pred-text">Calculating...</p>
+                        </div>
+                        <div class="text-right">
+                            <span class="block text-[10px] text-gray-400 uppercase">Recommended Overnight</span>
+                            <span class="block text-md font-mono font-bold text-purple-400" id="eod-script-text">---</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="overflow-x-auto h-48 border-t border-gray-700">
                     <table class="w-full text-sm text-left text-gray-400">
-                        <thead class="text-xs text-gray-500 uppercase bg-gray-900/50 border-b border-gray-700">
+                        <thead class="text-xs text-gray-500 uppercase bg-gray-900/50 border-b border-gray-700 sticky top-0">
                             <tr>
                                 <th class="px-4 py-2">Date</th>
                                 <th class="px-4 py-2">EOD Prediction</th>
@@ -578,25 +642,35 @@ HTML_INTERFACE = """
                 
                 updateText('rationale-text', strat.rationale); updateText('smc-text', strat.smc_status);
                 updateText('strike-text', strat.recommended_strike);
-                updateText('opt-target', strat.recommended_strike !== "---" ? strat.option_target_pts : "---");
-                updateText('opt-sl', strat.recommended_strike !== "---" ? strat.option_sl_pts : "---");
+                updateText('strike-time', `Updated: ${strat.timestamp}`);
+                updateText('opt-target', strat.opt_target_pts);
+                updateText('opt-sl', strat.opt_sl_pts);
                 updateText('signal-text', strat.signal);
-                updateClass('signal-text', "text-xl font-bold mb-4 " + (strat.signal.includes("BUY") || strat.signal.includes("UP") ? "text-emerald-400" : strat.signal.includes("SELL") || strat.signal.includes("DOWN") ? "text-red-400" : "text-gray-400"));
+                updateClass('signal-text', "text-xl font-bold mb-4 " + (strat.signal.includes("BUY") ? "text-emerald-400" : strat.signal.includes("SELL") ? "text-red-400" : "text-gray-400"));
                 updateText('target-price', strat.index_target > 0 ? "₹" + strat.index_target : "---");
                 updateText('sl-price', strat.index_sl > 0 ? "₹" + strat.index_sl : "---");
                 updateText('reversal-status', strat.reversal_warning);
                 updateClass('reversal-status', `${strat.reversal_color} font-bold text-xs`);
 
+                // Update EOD Live Projection Banner
+                updateText('eod-pred-text', strat.eod_pred);
+                updateText('eod-script-text', strat.eod_script);
+                updateClass('eod-pred-text', "text-xl font-bold mt-1 " + (strat.eod_pred.includes("UP") ? "text-emerald-400" : strat.eod_pred.includes("DOWN") ? "text-red-400" : "text-gray-400"));
+
                 if (data.trade_history && data.trade_history.length > 0) {
                     const tableHTML = data.trade_history.map(trade => `
                         <tr class="bg-gray-800 border-b border-gray-700 hover:bg-gray-700">
-                            <td class="px-4 py-3">${trade.time.split(' ')[1]}</td>
-                            <td class="px-4 py-3 font-bold ${trade.type.includes('BUY') || trade.type.includes('UP') ? 'text-emerald-400' : 'text-red-400'}">${trade.type}</td>
-                            <td class="px-4 py-3 text-gray-200 font-mono text-xs">${trade.strike}</td>
-                            <td class="px-4 py-3">${trade.entry}</td>
+                            <td class="px-4 py-3 text-xs whitespace-nowrap">${trade.time}</td>
+                            <td class="px-4 py-3 font-bold text-xs ${trade.type.includes('BUY') ? 'text-emerald-400' : 'text-red-400'}">${trade.type}</td>
+                            <td class="px-4 py-3 text-gray-200 font-mono text-xs">${trade.strike.replace("EXECUTE: ", "")}</td>
+                            <td class="px-4 py-3 text-xs">${trade.entry}</td>
+                            <td class="px-4 py-3 text-xs text-emerald-400">${trade.target}</td>
+                            <td class="px-4 py-3 text-xs text-red-400">${trade.sl}</td>
                         </tr>
                     `).join('');
                     updateHTML('trade-history-table', tableHTML);
+                } else {
+                    updateHTML('trade-history-table', '<tr class="bg-gray-800"><td colspan="6" class="px-4 py-4 text-center">No trades generated in recent history.</td></tr>');
                 }
 
                 if (strat.learning_history && strat.learning_history.length > 0) {
@@ -622,7 +696,6 @@ HTML_INTERFACE = """
             }
         }
         
-        if (Notification.permission !== "granted") { Notification.requestPermission(); }
         fetchMarketData(); setInterval(fetchMarketData, 5000); 
     </script>
 </body>
